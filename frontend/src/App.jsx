@@ -4,7 +4,6 @@ import logo from './assets/LOGO SORITAWOO.png';
 const API = import.meta.env.VITE_API_URL || null; // si se define, podemos integrar login y API luego
 const STORAGE_KEY = 'artist-alley-inventory-v1';
 
-
 function formatUSD(n) {
   try {
     return new Intl.NumberFormat('en-US', {
@@ -20,33 +19,52 @@ function formatUSD(n) {
 function downloadTextFile(filename, text) {
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
+
 function toCSV(items) {
   const headers = ['id','sku','nombre','categoria','precio','stock','ubicacion','notas'];
   const esc = v => { v = (v??'').toString().replaceAll('"','""'); return /[\n,"]/.test(v) ? `"${v}"` : v; };
   const rows = items.map(it => headers.map(h => esc(it[h])).join(','));
   return [headers.join(','), ...rows].join('\n');
 }
+
 function parseCSV(text) {
   const lines = text.replace(/\r/g,'').split('\n').filter(Boolean);
   if (!lines.length) return [];
   const headers = lines[0].split(',');
   const items = lines.slice(1).map(line => {
-    const cells = line.split(','); // simple
+    const cells = line.split(','); // simple (no soporta comas con comillas anidadas)
     const obj = {}; headers.forEach((h,i) => obj[h] = cells[i] ?? '');
-    obj.id = obj.id || crypto.randomUUID();
-    obj.precio = Number(obj.precio||0); obj.stock = Number(obj.stock||0);
+    obj.id = obj.id || (crypto?.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
+    obj.precio = Number(obj.precio||0);
+    obj.stock  = Number(obj.stock||0);
     return obj;
   });
   return items;
 }
 
-export default function App() {
-  const [items, setItems] = useState(() => {
+// ====== Carga inicial segura (sin demoData) ======
+const DEFAULT_ITEMS = []; // si quieres, puedes poner aquí un arreglo de ejemplo
+
+function loadInitial() {
+  try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : demoData;
-  });
+    if (!raw) return DEFAULT_ITEMS;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : DEFAULT_ITEMS;
+  } catch {
+    return DEFAULT_ITEMS;
+  }
+}
+
+export default function App() {
+  const [items, setItems] = useState(loadInitial);
   const [q, setQ] = useState('');
   const [categoria, setCategoria] = useState('todas');
   const [lowStockOnly, setLowStockOnly] = useState(false);
@@ -55,9 +73,16 @@ export default function App() {
   const [showModal, setShowModal] = useState(false);
   const fileRef = useRef(null);
 
-  useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); }, [items]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    } catch {}
+  }, [items]);
 
-  const categorias = useMemo(() => Array.from(new Set(items.map(i => i.categoria).filter(Boolean))).sort(), [items]);
+  const categorias = useMemo(
+    () => Array.from(new Set(items.map(i => i.categoria).filter(Boolean))).sort(),
+    [items]
+  );
 
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -70,15 +95,22 @@ export default function App() {
     });
   }, [items, q, categoria, lowStockOnly, lowStockThreshold]);
 
-  const valorTotal = useMemo(() => filtered.reduce((acc,i)=>acc+(i.precio||0)*(i.stock||0),0), [filtered]);
+  const valorTotal = useMemo(
+    () => filtered.reduce((acc,i)=>acc+(i.precio||0)*(i.stock||0),0),
+    [filtered]
+  );
 
-  function resetForm(){ setEditing({ id:null, sku:'', nombre:'', categoria:'', precio:0, stock:0, ubicacion:'', notas:'' }); setShowModal(true); }
+  function resetForm(){
+    setEditing({ id:null, sku:'', nombre:'', categoria:'', precio:0, stock:0, ubicacion:'', notas:'' });
+    setShowModal(true);
+  }
   function editItem(it){ setEditing({...it}); setShowModal(true); }
+
   function saveItem(e){
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
     const data = {
-      id: editing?.id || crypto.randomUUID(),
+      id: editing?.id || (crypto?.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random())),
       sku: String(fd.get('sku')||'').trim(),
       nombre: String(fd.get('nombre')||'').trim(),
       categoria: String(fd.get('categoria')||'').trim(),
@@ -91,14 +123,39 @@ export default function App() {
     setItems(prev => prev.some(p=>p.id===data.id) ? prev.map(p=>p.id===data.id?data:p) : [data, ...prev]);
     setShowModal(false);
   }
-  function removeItem(id){ if(!confirm('¿Eliminar este producto?')) return; setItems(prev => prev.filter(p=>p.id!==id)); }
-  function exportCSV(){ const csv = toCSV(items); const ts = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-'); downloadTextFile(`inventario-artistalley-${ts}.csv`, csv); }
+
+  function removeItem(id){
+    if(!confirm('¿Eliminar este producto?')) return;
+    setItems(prev => prev.filter(p=>p.id!==id));
+  }
+
+  function exportCSV(){
+    const csv = toCSV(items);
+    const ts = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    downloadTextFile(`inventario-artistalley-${ts}.csv`, csv);
+  }
+
   function onImportFile(e){
     const file = e.target.files?.[0]; if(!file) return;
-    const r = new FileReader(); r.onload = () => { try { const parsed = parseCSV(String(r.result||'')); if(!parsed.length){ alert('CSV vacío'); return; } setItems(parsed); alert('Inventario importado'); } catch { alert('Error al importar CSV'); } };
-    r.readAsText(file, 'utf-8'); e.target.value='';
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const parsed = parseCSV(String(r.result||''));
+        if(!parsed.length){ alert('CSV vacío'); return; }
+        setItems(parsed);
+        alert('Inventario importado');
+      } catch {
+        alert('Error al importar CSV');
+      }
+    };
+    r.readAsText(file, 'utf-8');
+    e.target.value='';
   }
-  function clearAll(){ if(!confirm('¿Borrar todo?')) return; setItems([]); }
+
+  function clearAll(){
+    if(!confirm('¿Borrar todo?')) return;
+    setItems([]);
+  }
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800">
@@ -106,10 +163,10 @@ export default function App() {
         <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <img
-  src={logo}
-  alt="Soritawo"
-  className="w-10 h-10 rounded-full object-cover ring-1 ring-black/10"
-/>
+              src={logo}
+              alt="Soritawo"
+              className="w-10 h-10 rounded-full object-cover ring-1 ring-black/10"
+            />
             <div>
               <h1 className="text-xl font-semibold">Inventario — Soritawo</h1>
               <p className="text-xs text-gray-500">Gestión rápida • Guardado local</p>
@@ -128,7 +185,12 @@ export default function App() {
       <main className="max-w-6xl mx-auto px-4 py-6">
         <div className="grid md:grid-cols-4 gap-3 mb-4">
           <div className="md:col-span-2">
-            <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Buscar por SKU, nombre, notas…" className="w-full px-3 py-2 rounded-xl border outline-none focus:ring-2 focus:ring-black"/>
+            <input
+              value={q}
+              onChange={e=>setQ(e.target.value)}
+              placeholder="Buscar por SKU, nombre, notas…"
+              className="w-full px-3 py-2 rounded-xl border outline-none focus:ring-2 focus:ring-black"
+            />
           </div>
           <div>
             <select value={categoria} onChange={e=>setCategoria(e.target.value)} className="w-full px-3 py-2 rounded-xl border">
@@ -194,7 +256,7 @@ export default function App() {
                       </div>
                     </td>
                   </tr>
-                )
+                );
               })}
             </tbody>
           </table>
