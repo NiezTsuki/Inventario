@@ -6,12 +6,13 @@ const STORAGE_KEY = 'artist-alley-inventory-v1';
 const SALES_KEY   = 'artist-alley-sales-v1';
 const ADJUST_KEY  = 'artist-alley-adjustments-v1'; // devoluciones y anulaciones
 
-function formatCLP(n) {
+function formatUSD(n) {
   try {
-    return new Intl.NumberFormat('es-CL', {
+    return new Intl.NumberFormat('en-US', {
       style: 'currency',
-      currency: 'CLP',
-      maximumFractionDigits: 0,
+      currency: 'USD',
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2,
     }).format(Number(n) || 0);
   } catch {
     return `$${n ?? 0}`;
@@ -97,8 +98,11 @@ export default function App() {
   // POS (ventas)
   const [posOpen, setPosOpen] = useState(false);
   const [skuTerm, setSkuTerm] = useState('');
-  // cart: { id: {id, sku, nombre, precio, qty, pay: 'EFECTIVO'|'YAPPY'} }
+  // cart: { id: {id, sku, nombre, precio, qty, pay} }
   const [cart, setCart] = useState({});
+  // descuento a nivel carrito
+  const [discount, setDiscount] = useState(0);
+
   const [sales, setSales] = useState(loadSales);
   const [lastSaleId, setLastSaleId] = useState(null);
 
@@ -106,11 +110,11 @@ export default function App() {
   const [ajustes, setAjustes] = useState(loadAjustes);
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  // selector de candidatos cuando hay varios matches
-  const [pickMatches, setPickMatches] = useState(null); // null | [{...item}, ...]
+  // selector si hay varios matches
+  const [pickMatches, setPickMatches] = useState(null);
 
   // devolución parcial
-  const [returnFor, setReturnFor] = useState(null); // { saleId, lines: [{id, nombre, qtyVendida, qtyMax, qtyDevolver}] }
+  const [returnFor, setReturnFor] = useState(null);
 
   useEffect(() => saveItems(items), [items]);
   useEffect(() => saveSales(sales), [sales]);
@@ -153,18 +157,33 @@ export default function App() {
   const totalUnidades = items.reduce((a,b)=>a + (b.stock||0), 0);
   const valorInventario = items.reduce((a,b)=>a + (b.stock||0)*(b.precio||0), 0);
 
+  // Helpers carrito
+  function cartItems(){ return Object.values(cart); }
+  function cartSubtotal(){
+    return cartItems().reduce((a,l)=> a + (l.precio||0)* (l.qty||0), 0);
+  }
+  function cartTotal(){
+    const sub = cartSubtotal();
+    return Math.max(0, sub - (Number(discount)||0));
+  }
+
   // === Ganancias por método y total (VENTAS OK - DEVOLUCIONES) ===
+  // Distribuimos el descuento proporcionalmente por método según el peso de cada línea.
   const ganancias = useMemo(() => {
     let efectivo = 0, yappy = 0;
 
-    // sumar ventas OK por línea con su método
     const saleMap = new Map(sales.map(s => [s.id, s]));
     for (const s of sales) {
-      if (s.status === 'OK') {
-        for (const l of s.items) {
-          const amt = (l.precio || 0) * (l.qty || 0);
-          if ((l.pay || 'EFECTIVO') === 'EFECTIVO') efectivo += amt; else yappy += amt;
-        }
+      if (s.status !== 'OK') continue;
+
+      const sumLines = s.items.reduce((a,l)=>a + (l.precio||0)*(l.qty||0), 0);
+      const disc = Math.min(sumLines, Math.max(0, Number(s.discount||0)));
+      for (const l of s.items) {
+        const lineAmt = (l.precio||0)*(l.qty||0);
+        const share = sumLines > 0 ? (lineAmt / sumLines) : 0;
+        const adj = share * disc; // parte del descuento que le corresponde a esta línea
+        const amtAfter = Math.max(0, lineAmt - adj);
+        if ((l.pay || 'EFECTIVO') === 'EFECTIVO') efectivo += amtAfter; else yappy += amtAfter;
       }
     }
 
@@ -173,11 +192,18 @@ export default function App() {
       if (aj.type !== 'DEVOLUCION') continue;
       const sale = saleMap.get(aj.refSaleId);
       if (!sale) continue;
+
+      const sumLines = sale.items.reduce((a,l)=>a + (l.precio||0)*(l.qty||0), 0);
+      const disc = Math.min(sumLines, Math.max(0, Number(sale.discount||0)));
+
       for (const it of aj.items) {
         const line = sale.items.find(li => li.id === it.id);
         if (!line) continue;
-        const amt = (line.precio || 0) * (it.qty || 0);
-        if ((line.pay || 'EFECTIVO') === 'EFECTIVO') efectivo -= amt; else yappy -= amt;
+        const lineAmt = (line.precio||0)*(it.qty||0);
+        const share = sumLines > 0 ? ((line.precio*line.qty)/sumLines) : 0;
+        const adj = share * disc * (it.qty/(line.qty||1)); // devolver proporcional a la parte devuelta
+        const amtAfter = Math.max(0, lineAmt - adj);
+        if ((line.pay || 'EFECTIVO') === 'EFECTIVO') efectivo -= amtAfter; else yappy -= amtAfter;
       }
     }
 
@@ -290,7 +316,7 @@ export default function App() {
         [item.id]: {
           id:item.id, sku:item.sku, nombre:item.nombre, precio:item.precio||0,
           qty: nextQty,
-          pay: existing?.pay || 'EFECTIVO' // método por línea
+          pay: existing?.pay || 'EFECTIVO'
         }
       };
     });
@@ -300,11 +326,11 @@ export default function App() {
     const t = term.trim().toLowerCase();
     if(!t) return;
 
-    // 1) match SKU exacto
-    let exact = items.find(i => (i.sku||'').toLowerCase() === t);
+    // 1) SKU exacto
+    const exact = items.find(i => (i.sku||'').toLowerCase() === t);
     if(exact){ pushCart(exact); setSkuTerm(''); return; }
 
-    // 2) por nombre/alias que contengan
+    // 2) por nombre/alias
     const candidates = items.filter(i => {
       const name = (i.nombre||'').toLowerCase();
       const aliases = (i.aliases||'').toLowerCase();
@@ -314,7 +340,7 @@ export default function App() {
     if(candidates.length === 0){ alert('No se encontró el producto'); return; }
     if(candidates.length === 1){ pushCart(candidates[0]); setSkuTerm(''); return; }
 
-    // 3) varios: dejar elegir (ordenados por categoría)
+    // 3) varios: elegir
     setPickMatches(candidates.sort((a,b)=> (a.categoria||'').localeCompare(b.categoria||'')));
   }
 
@@ -332,21 +358,13 @@ export default function App() {
     setCart(prev => ({ ...prev, [itemId]: { ...prev[itemId], pay: method }}));
   }
 
-  function clearCart(){ setCart({}); }
-
-  function cartItems(){
-    return Object.values(cart);
-  }
-
-  function cartTotal(){
-    return cartItems().reduce((a,l)=> a + (l.precio||0)* (l.qty||0), 0);
-  }
+  function clearCart(){ setCart({}); setDiscount(0); }
 
   function finalizeSale(){
     const lines = cartItems();
     if(lines.length === 0){ alert('Carrito vacío'); return; }
 
-    // validar stock disponible
+    // validar stock
     const insufficient = [];
     for(const line of lines){
       const prod = items.find(x => x.id === line.id);
@@ -368,11 +386,15 @@ export default function App() {
     });
     setItems(newItems);
 
-    // registrar venta (líneas incluyen pay)
+    // registrar venta (con descuento a nivel carrito)
+    const subtotal = cartSubtotal();
+    const disc = Math.min(subtotal, Math.max(0, Number(discount)||0));
     const sale = {
       id: makeId(),
       ts: new Date().toISOString(),
-      total: cartTotal(),
+      subtotal,
+      discount: disc,
+      total: Math.max(0, subtotal - disc),
       items: lines.map(l => ({
         id:l.id, sku:l.sku, nombre:l.nombre, precio:l.precio, qty:l.qty,
         pay: l.pay || 'EFECTIVO',
@@ -403,7 +425,7 @@ export default function App() {
       return Array.from(map.values());
     });
 
-    // quitar del log (deshacer rápida)
+    // quitar del log
     setSales(prev => prev.filter(s => s.id !== lastSaleId));
     setLastSaleId(null);
     alert('Última venta deshecha');
@@ -419,7 +441,7 @@ export default function App() {
         }
       }
     }
-    return map; // id -> qty devuelta
+    return map;
   }
 
   function voidSale(saleId){
@@ -437,10 +459,8 @@ export default function App() {
       return Array.from(map.values());
     });
 
-    // marcar venta como ANULADA (no la borramos)
+    // marcar venta como ANULADA y registrar ajuste
     setSales(prev => prev.map(s => s.id===saleId ? {...s, status:'ANULADA'} : s));
-
-    // registrar ajuste
     const aj = { id: makeId(), ts: new Date().toISOString(), type:'ANULACION', refSaleId: saleId, items: sale.items.map(l=>({id:l.id, qty:l.qty})) };
     setAjustes(prev => [aj, ...prev]);
 
@@ -448,7 +468,6 @@ export default function App() {
   }
 
   function startReturn(sale){
-    // calcula cuánto queda por poder devolver (vendida - ya devuelta)
     const devMap = returnedQtyMapForSale(sale.id);
     const lines = sale.items.map(l => {
       const yaDev = devMap.get(l.id)||0;
@@ -500,15 +519,6 @@ export default function App() {
     alert('Devolución registrada ✓');
   }
 
-  /* ------------- Limpiar historial ------------- */
-  function clearSalesHistory() {
-    if (!confirm('¿Borrar TODO el historial de ventas y ajustes? Esto pondrá las ganancias en $0.')) return;
-    setSales([]);         // borra ventas
-    setAjustes([]);       // borra devoluciones/anulaciones
-    setLastSaleId(null);  // resetea “deshacer”
-    alert('Historial limpiado ✓');
-  }
-
   /* ================== UI ================== */
   return (
     <div className="min-h-screen bg-white text-gray-900">
@@ -530,7 +540,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Resumen inventario */}
+      {/* Resúmenes */}
       <section className="max-w-6xl mx-auto px-4 py-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="rounded-2xl border p-4">
           <div className="text-xs text-gray-500">Productos</div>
@@ -542,27 +552,27 @@ export default function App() {
         </div>
         <div className="rounded-2xl border p-4">
           <div className="text-xs text-gray-500">Valor inventario</div>
-          <div className="text-2xl font-semibold">{formatCLP(valorInventario)}</div>
+          <div className="text-2xl font-semibold">{formatUSD(valorInventario)}</div>
         </div>
       </section>
 
-      {/* Resumen ganancias */}
+      {/* Ganancias */}
       <section className="max-w-6xl mx-auto px-4 -mt-2 pb-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="rounded-2xl border p-4">
           <div className="text-xs text-gray-500">Ganancia Efectivo</div>
-          <div className="text-2xl font-semibold">{formatCLP(ganancias.efectivo)}</div>
+          <div className="text-2xl font-semibold">{formatUSD(ganancias.efectivo)}</div>
         </div>
         <div className="rounded-2xl border p-4">
           <div className="text-xs text-gray-500">Ganancia Yappy</div>
-          <div className="text-2xl font-semibold">{formatCLP(ganancias.yappy)}</div>
+          <div className="text-2xl font-semibold">{formatUSD(ganancias.yappy)}</div>
         </div>
         <div className="rounded-2xl border p-4">
           <div className="text-xs text-gray-500">Ganancia Total</div>
-          <div className="text-2xl font-semibold">{formatCLP(ganancias.total)}</div>
+          <div className="text-2xl font-semibold">{formatUSD(ganancias.total)}</div>
         </div>
       </section>
 
-      {/* Búsqueda */}
+      {/* Búsqueda + Filtro */}
       <section className="max-w-6xl mx-auto px-4">
         <div className="flex items-center gap-2">
           <input
@@ -573,8 +583,6 @@ export default function App() {
           />
         </div>
       </section>
-
-      {/* Filtro por Categoría */}
       <section className="max-w-6xl mx-auto px-4 mt-2">
         <div className="flex flex-wrap gap-2">
           {categorias.map(cat => (
@@ -616,7 +624,7 @@ export default function App() {
                     {i.aliases && <div className="text-xs text-gray-400">Alias: {i.aliases}</div>}
                   </td>
                   <td className="px-4 py-2 hidden sm:table-cell">{i.categoria || '-'}</td>
-                  <td className="px-4 py-2 text-right">{formatCLP(i.precio)}</td>
+                  <td className="px-4 py-2 text-right">{formatUSD(i.precio)}</td>
                   <td className="px-4 py-2 text-right">{i.stock}</td>
                   <td className="px-4 py-2 hidden sm:table-cell">{i.notas}</td>
                   <td className="px-4 py-2 text-right hidden sm:table-cell">
@@ -651,7 +659,14 @@ export default function App() {
               </div>
               <div className="grid gap-1">
                 <label className="text-xs text-gray-500">Precio</label>
-                <input name="precio" defaultValue={editItem?.precio??0} type="number" min="0" step="1" className="px-3 py-2 rounded-xl border text-right" />
+                <input
+                  name="precio"
+                  defaultValue={editItem?.precio ?? 0}
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  className="px-3 py-2 rounded-xl border text-right"
+                />
               </div>
               <div className="grid gap-1">
                 <label className="text-xs text-gray-500">Stock</label>
@@ -678,7 +693,7 @@ export default function App() {
         </div>
       )}
 
-      {/* POS — Bottom-sheet mobile-first */}
+      {/* POS — Bottom-sheet */}
       {posOpen && (
         <div
           className="fixed inset-0 bg-black/40 z-50"
@@ -686,12 +701,10 @@ export default function App() {
           role="dialog"
           aria-modal="true"
         >
-          {/* Contenedor bottom-sheet en mobile / centrado en desktop */}
           <div
-            className="absolute left-0 right-0 bottom-0 md:inset-0 md:m-auto md:h-[80vh] md:max-w-3xl bg-white rounded-t-3xl md:rounded-2xl shadow-xl border pos-sheet"
+            className="absolute left-0 right-0 bottom-0 md:inset-0 md:m-auto md:h-[80vh] md:max-w-3xl bg-white rounded-t-3xl md:rounded-2xl shadow-xl border"
             onClick={(e) => e.stopPropagation()}
           >
-            {/* “Handle” de arrastre visual */}
             <div className="flex justify-center py-2 md:hidden">
               <div className="h-1.5 w-12 rounded-full bg-gray-300" />
             </div>
@@ -701,12 +714,12 @@ export default function App() {
               <h2 className="text-base md:text-lg font-semibold">Modo Venta</h2>
               <div className="flex items-center gap-2">
                 <button onClick={()=>setHistoryOpen(true)} className="px-3 py-2 rounded-xl border text-sm">Historial</button>
-                <button onClick={clearSalesHistory} className="px-3 py-2 rounded-xl border text-sm text-red-600">Limpiar historial</button>
+                <button onClick={() => { if(confirm('¿Borrar TODO el historial de ventas y ajustes? Esto pondrá las ganancias en $0.')){ setSales([]); setAjustes([]); setLastSaleId(null);} }} className="px-3 py-2 rounded-xl border text-sm text-red-600">Limpiar historial</button>
                 <button onClick={() => setPosOpen(false)} className="px-3 py-2 rounded-xl border text-sm" aria-label="Cerrar">Cerrar</button>
               </div>
             </div>
 
-            {/* Contenido scrollable (barra Vender sticky incluida adentro) */}
+            {/* Contenido scrollable */}
             <div className="px-4 pt-3 pb-4 overflow-y-auto h-full">
               {/* Input rápido SKU/Nombre/Alias */}
               <div className="flex gap-2">
@@ -714,126 +727,88 @@ export default function App() {
                   autoFocus
                   value={skuTerm}
                   onChange={(e) => setSkuTerm(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      addToCartByTerm(skuTerm);
-                    }
-                  }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addToCartByTerm(skuTerm); } }}
                   placeholder="Escanea/Escribe SKU, nombre o alias y Enter"
                   className="flex-1 px-3 py-3 rounded-xl border outline-none focus:ring-2 focus:ring-black text-base"
                   inputMode="search"
                 />
-                <button
-                  onClick={() => addToCartByTerm(skuTerm)}
-                  className="px-4 py-3 rounded-xl bg-black text-white text-base"
-                >
+                <button onClick={() => addToCartByTerm(skuTerm)} className="px-4 py-3 rounded-xl bg-black text-white text-base">
                   Agregar
                 </button>
               </div>
 
-              {/* Lista de ítems del carrito (cards en mobile) */}
+              {/* Ítems del carrito */}
               <div className="mt-3 space-y-2">
                 {Object.values(cart).length === 0 && (
-                  <div className="px-3 py-10 text-center text-gray-500">
-                    Agrega productos con Enter…
-                  </div>
+                  <div className="px-3 py-10 text-center text-gray-500">Agrega productos con Enter…</div>
                 )}
-
                 {Object.values(cart).map((l) => {
                   const cat = items.find(x=>x.id===l.id)?.categoria;
                   return (
                     <div key={l.id} className="rounded-2xl border p-3 flex items-center gap-3 flex-wrap">
                       <div className="min-w-0 flex-1">
-                        <div className="text-sm text-gray-500 font-mono truncate">
-                          {l.sku || '—'}
-                        </div>
-                        <div className="text-base font-medium truncate">
-                          {l.nombre}
-                        </div>
-                        {/* Categoría debajo del nombre */}
-                        <div className="text-xs text-gray-500">
-                          {cat ? `[${cat}]` : ' '}
-                        </div>
-                        <div className="text-sm text-gray-600">
-                          {formatCLP(l.precio)} c/u
-                        </div>
+                        <div className="text-sm text-gray-500 font-mono truncate">{l.sku || '—'}</div>
+                        <div className="text-base font-medium truncate">{l.nombre}</div>
+                        <div className="text-xs text-gray-500">{cat ? `[${cat}]` : ' '}</div>
+                        <div className="text-sm text-gray-600">{formatUSD(l.precio)} c/u</div>
 
                         {/* Método de pago por línea */}
                         <div className="mt-2 flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={()=>setLinePay(l.id,'EFECTIVO')}
-                            className={`px-3 py-1.5 rounded-lg border text-sm ${l.pay==='EFECTIVO' ? 'bg-black text-white' : ''}`}
-                          >
+                          <button type="button" onClick={()=>setLinePay(l.id,'EFECTIVO')} className={`px-3 py-1.5 rounded-lg border text-sm ${l.pay==='EFECTIVO' ? 'bg-black text-white' : ''}`}>
                             Efectivo
                           </button>
-                          <button
-                            type="button"
-                            onClick={()=>setLinePay(l.id,'YAPPY')}
-                            className={`px-3 py-1.5 rounded-lg border text-sm ${l.pay==='YAPPY' ? 'bg-black text-white' : ''}`}
-                          >
+                          <button type="button" onClick={()=>setLinePay(l.id,'YAPPY')} className={`px-3 py-1.5 rounded-lg border text-sm ${l.pay==='YAPPY' ? 'bg-black text-white' : ''}`}>
                             Yappy
                           </button>
                         </div>
                       </div>
 
-                      {/* Steppers +/− simples (solo onClick) */}
+                      {/* Cantidad */}
                       <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          className="btn-stepper h-11 w-11 rounded-xl border text-2xl"
-                          onClick={() => setQty(l.id, Math.max(0, (l.qty || 0) - 1))}
-                          aria-label="Disminuir"
-                        >
-                          −
-                        </button>
-
-                        <input
-                          type="text"
-                          inputMode="numeric"
-                          pattern="[0-9]*"
-                          className="w-16 h-11 text-center rounded-xl border text-lg"
-                          value={l.qty}
-                          onChange={(e) =>
-                            setQty(l.id, e.target.value.replace(/[^0-9]/g, ''))
-                          }
-                        />
-
-                        <button
-                          type="button"
-                          className="btn-stepper h-11 w-11 rounded-xl border text-2xl"
-                          onClick={() => setQty(l.id, (l.qty || 0) + 1)}
-                          aria-label="Aumentar"
-                        >
-                          +
-                        </button>
+                        <button type="button" className="h-11 w-11 rounded-xl border text-2xl" onClick={() => setQty(l.id, Math.max(0, (l.qty || 0) - 1))} aria-label="Disminuir">−</button>
+                        <input type="text" inputMode="numeric" pattern="[0-9]*" className="w-16 h-11 text-center rounded-xl border text-lg" value={l.qty} onChange={(e) => setQty(l.id, e.target.value.replace(/[^0-9]/g, ''))}/>
+                        <button type="button" className="h-11 w-11 rounded-xl border text-2xl" onClick={() => setQty(l.id, (l.qty || 0) + 1)} aria-label="Aumentar">+</button>
                       </div>
 
                       <div className="text-right min-w-[88px]">
                         <div className="text-sm text-gray-500">Subtotal</div>
-                        <div className="text-base font-semibold">
-                          {formatCLP((l.precio || 0) * (l.qty || 0))}
-                        </div>
+                        <div className="text-base font-semibold">{formatUSD((l.precio || 0) * (l.qty || 0))}</div>
                       </div>
 
-                      <button
-                        onClick={() => setQty(l.id, 0)}
-                        className="h-11 px-3 rounded-xl border text-red-600"
-                      >
-                        Quitar
-                      </button>
+                      <button onClick={() => setQty(l.id, 0)} className="h-11 px-3 rounded-xl border text-red-600">Quitar</button>
                     </div>
                   );
                 })}
               </div>
 
-              {/* Barra de acciones (sticky) SIEMPRE visible dentro del sheet */}
+              {/* Barra de acciones (sticky) */}
               <div className="sticky bottom-0 bg-white/95 backdrop-blur border-t mt-3 pb-safe">
-                <div className="py-3 flex items-center justify-between gap-2">
-                  <div className="text-lg md:text-xl font-semibold">
-                    Total: {formatCLP(cartTotal())}
+                <div className="py-3 flex items-center justify-between gap-2 flex-wrap">
+                  <div className="space-y-0.5">
+                    <div className="text-sm text-gray-500">Subtotal: <span className="font-semibold text-gray-700">{formatUSD(cartSubtotal())}</span></div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-gray-500">Descuento:</span>
+                      <input
+                        type="number"
+                        inputMode="decimal"
+                        step="0.01"
+                        min="0"
+                        value={discount}
+                        onChange={(e)=>{
+                          const sub = cartSubtotal();
+                          const v = Math.max(0, Number(e.target.value)||0);
+                          setDiscount(Math.min(v, sub));
+                        }}
+                        className="w-28 px-3 py-2 rounded-xl border text-right"
+                        aria-label="Descuento en USD"
+                      />
+                      <button type="button" className="px-2 py-1 rounded-lg border text-xs" onClick={()=>setDiscount(d=>Math.min(cartSubtotal(), Math.max(0, (+d||0) + 0.5)))}>+ $0.50</button>
+                      <button type="button" className="px-2 py-1 rounded-lg border text-xs" onClick={()=>setDiscount(d=>Math.max(0, (+d||0) - 0.5))}>− $0.50</button>
+                      <button type="button" className="px-2 py-1 rounded-lg border text-xs" onClick={()=>setDiscount(0)}>Limpiar</button>
+                    </div>
+                    <div className="text-lg md:text-xl font-semibold">Total: {formatUSD(cartTotal())}</div>
                   </div>
+
                   <div className="flex items-center gap-2">
                     <button onClick={clearCart} className="px-4 py-3 rounded-xl border text-base">Vaciar</button>
                     <button onClick={finalizeSale} className="px-5 py-3 rounded-xl bg-black text-white text-base">Vender</button>
@@ -850,14 +825,8 @@ export default function App() {
       {/* Selector de candidatos cuando hay varios matches */}
       {Array.isArray(pickMatches) && (
         <div className="fixed inset-0 bg-black/40 z-50" onClick={()=>setPickMatches(null)}>
-          <div
-            className="absolute left-0 right-0 bottom-0 bg-white rounded-t-3xl border shadow-xl pos-sheet"
-            style={{height:'70vh', maxHeight:'70vh'}}
-            onClick={e=>e.stopPropagation()}
-          >
-            <div className="flex justify-center py-2">
-              <div className="h-1.5 w-12 rounded-full bg-gray-300" />
-            </div>
+          <div className="absolute left-0 right-0 bottom-0 bg-white rounded-t-3xl border shadow-xl" style={{height:'70vh', maxHeight:'70vh'}} onClick={e=>e.stopPropagation()}>
+            <div className="flex justify-center py-2"><div className="h-1.5 w-12 rounded-full bg-gray-300" /></div>
             <div className="px-4 pb-3 border-b flex items-center justify-between">
               <h3 className="text-base font-semibold">Elige producto</h3>
               <button className="px-3 py-2 rounded-xl border" onClick={()=>setPickMatches(null)}>Cerrar</button>
@@ -865,16 +834,10 @@ export default function App() {
             <div className="p-3 overflow-y-auto h-full">
               <div className="grid gap-2">
                 {pickMatches.map(p => (
-                  <button
-                    key={p.id}
-                    onClick={()=>{ pushCart(p); setPickMatches(null); setSkuTerm(''); }}
-                    className="text-left rounded-2xl border p-3 hover:bg-gray-50"
-                  >
+                  <button key={p.id} onClick={()=>{ pushCart(p); setPickMatches(null); setSkuTerm(''); }} className="text-left rounded-2xl border p-3 hover:bg-gray-50">
                     <div className="text-sm text-gray-500 font-mono">{p.sku || '—'}</div>
                     <div className="font-medium">{p.nombre}</div>
-                    <div className="text-sm text-gray-600">
-                      {p.categoria ? `[${p.categoria}] ` : ''}{formatCLP(p.precio)} • Stock: {p.stock}
-                    </div>
+                    <div className="text-sm text-gray-600">{p.categoria ? `[${p.categoria}] ` : ''}{formatUSD(p.precio)} • Stock: {p.stock}</div>
                     {p.aliases && <div className="text-xs text-gray-400 mt-1">Alias: {p.aliases}</div>}
                   </button>
                 ))}
@@ -891,7 +854,7 @@ export default function App() {
             <div className="p-4 border-b flex items-center justify-between">
               <h3 className="text-lg font-semibold">Historial de ventas</h3>
               <div className="flex items-center gap-2">
-                <button onClick={clearSalesHistory} className="px-3 py-2 rounded-xl border text-sm text-red-600">Limpiar historial</button>
+                <button onClick={()=>{ if(confirm('¿Borrar TODO el historial de ventas y ajustes? Esto pondrá las ganancias en $0.')) { setSales([]); setAjustes([]); setLastSaleId(null);} }} className="px-3 py-2 rounded-xl border text-sm text-red-600">Limpiar historial</button>
                 <button onClick={()=>setHistoryOpen(false)} className="px-3 py-2 rounded-xl border">Cerrar</button>
               </div>
             </div>
@@ -903,15 +866,16 @@ export default function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="text-sm text-gray-500">#{s.id.slice(-6)} • {new Date(s.ts).toLocaleString()}</div>
                       <div className="text-sm font-semibold">
-                        {formatCLP(s.total)} {s.status==='ANULADA' && <span className="ml-2 px-2 py-0.5 rounded-full text-xs border text-red-600">ANULADA</span>}
+                        {formatUSD(s.total)} {s.status==='ANULADA' && <span className="ml-2 px-2 py-0.5 rounded-full text-xs border text-red-600">ANULADA</span>}
                       </div>
                     </div>
 
                     <div className="mt-2 text-sm text-gray-700">
+                      <div className="text-gray-500">Subtotal: {formatUSD(s.subtotal)} • Descuento: {formatUSD(s.discount)}</div>
                       {s.items.map(l => (
                         <div key={l.id} className="flex justify-between">
                           <span>{l.nombre} × {l.qty} <span className="text-gray-500">[{l.pay}]</span></span>
-                          <span>{formatCLP(l.subtotal)}</span>
+                          <span>{formatUSD(l.subtotal)}</span>
                         </div>
                       ))}
                     </div>
@@ -945,20 +909,9 @@ export default function App() {
                     <div className="text-sm">{l.nombre}</div>
                     <div className="text-xs text-gray-500">Vendida: {l.qtyVendida} • Máx. a devolver: {l.qtyMax}</div>
                     <div className="mt-2 flex items-center gap-2">
-                      <button
-                        className="h-10 w-10 rounded-xl border text-2xl"
-                        onClick={()=>updateReturnQty(idx, Math.max(0,(l.qtyDevolver||0)-1))}
-                      >−</button>
-                      <input
-                        className="w-20 h-10 text-center rounded-xl border"
-                        inputMode="numeric" pattern="[0-9]*"
-                        value={l.qtyDevolver}
-                        onChange={e=>updateReturnQty(idx, clampInt(e.target.value, 0, l.qtyMax))}
-                      />
-                      <button
-                        className="h-10 w-10 rounded-xl border text-2xl"
-                        onClick={()=>updateReturnQty(idx, Math.min(l.qtyMax,(l.qtyDevolver||0)+1))}
-                      >+</button>
+                      <button className="h-10 w-10 rounded-xl border text-2xl" onClick={()=>updateReturnQty(idx, Math.max(0,(l.qtyDevolver||0)-1))}>−</button>
+                      <input className="w-20 h-10 text-center rounded-xl border" inputMode="numeric" pattern="[0-9]*" value={l.qtyDevolver} onChange={e=>updateReturnQty(idx, clampInt(e.target.value, 0, l.qtyMax))}/>
+                      <button className="h-10 w-10 rounded-xl border text-2xl" onClick={()=>updateReturnQty(idx, Math.min(l.qtyMax,(l.qtyDevolver||0)+1))}>+</button>
                     </div>
                   </div>
                 ))}
